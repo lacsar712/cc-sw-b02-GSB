@@ -17,9 +17,13 @@ def connect():
 def claim_one(conn):
     row = conn.execute(
         """
-        SELECT id, nominal_nm, measured_nm FROM jobs
-        WHERE status='pending'
-        ORDER BY id
+        SELECT j.id, j.nominal_nm, j.measured_nm FROM jobs j
+        WHERE j.status='pending'
+          AND NOT EXISTS (
+              SELECT 1 FROM lamp_gates g
+              WHERE g.lamp = j.lamp AND g.paused
+          )
+        ORDER BY j.id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         """

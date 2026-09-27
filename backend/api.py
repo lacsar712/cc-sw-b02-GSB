@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lamp_gates (
+    lamp text PRIMARY KEY,
+    paused boolean NOT NULL DEFAULT false,
+    updated_by text NOT NULL,
+    updated_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gate_events (
+    id serial PRIMARY KEY,
+    lamp text NOT NULL,
+    action text NOT NULL,
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -123,6 +136,91 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+def set_gate(lamp: str, paused: bool, username: str) -> dict:
+    """暂停或恢复某灯种的领取；状态真正变化时记一条流水。返回最新闸门状态。"""
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT paused FROM lamp_gates WHERE lamp = %s FOR UPDATE", (lamp,)
+        ).fetchone()
+        changed = not row or row["paused"] != paused
+        if changed:
+            conn.execute(
+                """
+                INSERT INTO lamp_gates(lamp, paused, updated_by, updated_at)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (lamp) DO UPDATE
+                SET paused = EXCLUDED.paused,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (lamp, paused, username, now),
+            )
+            conn.execute(
+                "INSERT INTO gate_events(lamp, action, actor, created_at) VALUES (%s,%s,%s,%s)",
+                (lamp, "pause" if paused else "resume", username, now),
+            )
+            conn.commit()
+        return {"lamp": lamp, "paused": paused, "changed": changed}
+
+
+@get("/api/gates")
+async def list_gates(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            WITH lamps AS (
+                SELECT lamp FROM jobs
+                UNION
+                SELECT lamp FROM lamp_gates
+            )
+            SELECT l.lamp,
+                   COALESCE(g.paused, false) AS paused,
+                   g.updated_by,
+                   g.updated_at,
+                   (SELECT COUNT(*) FROM jobs j
+                     WHERE j.lamp = l.lamp AND j.status = 'pending') AS pending_count
+            FROM lamps l
+            LEFT JOIN lamp_gates g ON g.lamp = l.lamp
+            ORDER BY l.lamp
+            """
+        ).fetchall()
+        return list(rows)
+
+
+@post("/api/gates/{lamp:str}/pause")
+async def pause_gate(request: Request, lamp: str) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可操作闸门")
+    lamp = lamp.strip()
+    if not lamp:
+        raise HTTPException(status_code=400, detail="灯种不能为空")
+    return set_gate(lamp, True, user["username"])
+
+
+@post("/api/gates/{lamp:str}/resume")
+async def resume_gate(request: Request, lamp: str) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可操作闸门")
+    lamp = lamp.strip()
+    if not lamp:
+        raise HTTPException(status_code=400, detail="灯种不能为空")
+    return set_gate(lamp, False, user["username"])
+
+
+@get("/api/gates/events")
+async def list_gate_events(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, lamp, action, actor, created_at FROM gate_events ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        return list(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +239,7 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[health, login, list_jobs, get_job, create_job, list_gates, pause_gate, resume_gate, list_gate_events],
+    on_startup=[on_startup],
+)
