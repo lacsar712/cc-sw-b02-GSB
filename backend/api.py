@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lamp_gates (
+    lamp text PRIMARY KEY,
+    paused boolean NOT NULL DEFAULT false,
+    updated_by text NOT NULL DEFAULT '',
+    updated_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS gate_events (
+    id serial PRIMARY KEY,
+    lamp text NOT NULL,
+    action text NOT NULL,
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -46,6 +59,11 @@ class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
     measured_nm: float
+
+
+class GateIn(BaseModel):
+    lamp: str
+    action: str
 
 
 def user_from_request(request: Request) -> dict:
@@ -123,6 +141,73 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+@get("/api/gates")
+async def list_gates(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            WITH lamps AS (
+                SELECT lamp FROM jobs
+                UNION
+                SELECT lamp FROM lamp_gates
+            )
+            SELECT l.lamp,
+                   COALESCE(g.paused, false) AS paused,
+                   COALESCE(g.updated_by, '') AS updated_by,
+                   g.updated_at,
+                   (SELECT COUNT(*) FROM jobs j WHERE j.lamp = l.lamp AND j.status = 'pending') AS pending_count
+            FROM lamps l
+            LEFT JOIN lamp_gates g ON g.lamp = l.lamp
+            ORDER BY l.lamp
+            """
+        ).fetchall()
+        return list(rows)
+
+
+@post("/api/gates")
+async def set_gate(request: Request, data: GateIn) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可操作暂停闸")
+    lamp = data.lamp.strip()
+    if not lamp:
+        raise HTTPException(status_code=400, detail="灯种不能为空")
+    if data.action not in ("pause", "resume"):
+        raise HTTPException(status_code=400, detail="未知闸门动作")
+    paused = data.action == "pause"
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute("SELECT paused FROM lamp_gates WHERE lamp = %s", (lamp,)).fetchone()
+        was_paused = row["paused"] if row else False
+        conn.execute(
+            """
+            INSERT INTO lamp_gates(lamp, paused, updated_by, updated_at)
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT (lamp) DO UPDATE
+            SET paused = EXCLUDED.paused, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+            """,
+            (lamp, paused, user["username"], now),
+        )
+        if paused != was_paused:
+            conn.execute(
+                "INSERT INTO gate_events(lamp, action, actor, created_at) VALUES (%s,%s,%s,%s)",
+                (lamp, data.action, user["username"], now),
+            )
+        conn.commit()
+        return {"lamp": lamp, "paused": paused}
+
+
+@get("/api/gate-events")
+async def list_gate_events(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, lamp, action, actor, created_at FROM gate_events ORDER BY id DESC"
+        ).fetchall()
+        return list(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +226,7 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[health, login, list_jobs, get_job, create_job, list_gates, set_gate, list_gate_events],
+    on_startup=[on_startup],
+)

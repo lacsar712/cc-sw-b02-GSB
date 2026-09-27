@@ -19,6 +19,7 @@ def claim_one(conn):
         """
         SELECT id, nominal_nm, measured_nm FROM jobs
         WHERE status='pending'
+          AND lamp NOT IN (SELECT lamp FROM lamp_gates WHERE paused)
         ORDER BY id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
